@@ -8,6 +8,8 @@ import com.rethinkdb.gen.proto.Protocol;
 import com.rethinkdb.gen.proto.Version;
 import com.rethinkdb.model.Arguments;
 import com.rethinkdb.model.OptArgs;
+import org.reactivestreams.Subscriber;
+import org.reactivestreams.Subscription;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -199,7 +201,7 @@ public class Connection implements Closeable {
      * @param deadline the timeout.
      * @return a completable future.
      */
-    private Future<Response> sendQuery(Query query, Optional<Long> deadline) {
+    private CompletableFuture<Response> sendQuery(Query query, Optional<Long> deadline) {
         // check if response pump is running
         if (!exec.isShutdown() && !exec.isTerminated()) {
             final CompletableFuture<Response> awaiter = new CompletableFuture<>();
@@ -208,7 +210,7 @@ public class Connection implements Closeable {
                 lock.lock();
                 socket.orElseThrow(() -> new ReqlDriverError("No socket available."))
                         .write(query.serialize());
-                return awaiter.toCompletableFuture();
+                return awaiter;
             } finally {
                 lock.unlock();
             }
@@ -321,15 +323,74 @@ public class Connection implements Closeable {
         return run(term, globalOpts, pojoClass, Optional.empty());
     }
 
-    public <T, P> T run(ReqlAst term, OptArgs globalOpts, Optional<Class<P>> pojoClass, Optional<Long> timeout) {
+    private Query newQuery(ReqlAst term, OptArgs globalOpts) {
         setDefaultDB(globalOpts);
         Query q = Query.start(newToken(), term, globalOpts);
         if (globalOpts.containsKey("noreply")) {
             throw new ReqlDriverError(
-                    "Don't provide the noreply option as an optarg. " +
-                            "Use `.runNoReply` instead of `.run`");
+                "Don't provide the noreply option as an optarg. " +
+                    "Use `.runNoReply` instead of `.run`");
         }
-        return runQuery(q, pojoClass, timeout);
+        return q;
+    }
+
+    public <T, P> T run(ReqlAst term, OptArgs globalOpts, Optional<Class<P>> pojoClass, Optional<Long> timeout) {
+        return runQuery(newQuery(term, globalOpts), pojoClass, timeout);
+    }
+
+    public <T, P> Subscription runAsync(ReqlAst term, OptArgs globalOpts, Optional<Class<P>> pojoClass, Subscriber<T> subscriber) {
+        return runQueryAsync(newQuery(term, globalOpts), pojoClass, subscriber);
+    }
+
+    private <P, T> Subscription runQueryAsync(Query query, Optional<Class<P>> pojoClass, Subscriber<T> subscriber) {
+
+        CompletableFuture<Response> await = sendQuery(query, Optional.empty());
+        handleAsyncResponse(query, pojoClass, subscriber, await);
+
+        Subscription subscription = new Subscription() {
+            @Override
+            public void request(long n) {
+            }
+
+            @Override
+            public void cancel() {
+                runQueryNoreply(Query.stop(query.token));
+                await.cancel(false);
+            }
+        };
+        subscriber.onSubscribe(subscription);
+        return subscription;
+    }
+
+    private <P, T> void handleAsyncResponse(Query query, Optional<Class<P>> pojoClass, Subscriber<T> subscriber, CompletableFuture<Response> future) {
+        future.whenComplete((res, ex) -> {
+            if (ex != null) {
+                subscriber.onError(ex);
+                return;
+            }
+
+            if (res.isError()) {
+                subscriber.onError(res.makeError(query));
+                return;
+            }
+
+            Converter.FormatOptions fmt = new Converter.FormatOptions(query.globalOptions);
+            List<?> converted = (List<?>) Converter.convertPseudotypes(res.data, fmt);
+
+            if (converted.isEmpty() && res.isAtom()) {
+                subscriber.onError(new ReqlDriverError("Atom response was empty!"));
+                return;
+            }
+
+            converted.forEach(value -> subscriber.onNext(Util.convertToPojo(value, pojoClass)));
+
+            if (res.isAtom() || res.isWaitComplete()) {
+                subscriber.onComplete();
+            } else {
+                // continue
+                handleAsyncResponse(query, pojoClass, subscriber, sendQuery(Query.continue_(query.token), Optional.empty()));
+            }
+        });
     }
 
     public void runNoReply(ReqlAst term, OptArgs globalOpts) {

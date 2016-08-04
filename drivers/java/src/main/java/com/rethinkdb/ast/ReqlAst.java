@@ -6,6 +6,8 @@ import com.rethinkdb.model.Arguments;
 import com.rethinkdb.model.OptArgs;
 import com.rethinkdb.net.Connection;
 import org.json.simple.JSONArray;
+import org.reactivestreams.Subscriber;
+import org.reactivestreams.Subscription;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -63,6 +65,10 @@ public class ReqlAst {
      */
     public <T> T run(Connection conn) {
         return conn.run(this, new OptArgs(), Optional.empty());
+    }
+
+    public <T> Subscription runAsync(Connection conn, Subscriber<T> subscriber) {
+        return conn.runAsync(this, new OptArgs(), Optional.empty(), subscriber);
     }
 
     /**
